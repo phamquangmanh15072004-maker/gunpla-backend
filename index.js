@@ -24,7 +24,9 @@ const payos = new PayOS({
 const app = express();
 app.use(cors());
 app.use(express.json());
-
+app.get('/', (req, res) => {
+    res.status(200).send('Gunpla Server is awake and running!');
+});
 // ==========================================
 // API 1: TẠO LINK THANH TOÁN (Giữ nguyên)
 // ==========================================
