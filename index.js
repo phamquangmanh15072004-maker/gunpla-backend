@@ -149,7 +149,65 @@ app.post('/api/send-fcm', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+// ... (Các API ở trên giữ nguyên)
 
+// ==========================================
+// 4. LÍNH GÁC KHO (AUTO LOW STOCK ALERT)
+// Tự động lắng nghe sự thay đổi của bảng 'products'
+// ==========================================
+console.log("👀 Đang khởi động hệ thống Lính Gác Kho...");
+
+db.collection('products').onSnapshot((snapshot) => {
+    snapshot.docChanges().forEach(async (change) => {
+        // Chỉ quan tâm khi có sản phẩm bị thay đổi (modified)
+        if (change.type === 'modified') {
+            const product = change.doc.data();
+            const productId = change.doc.id;
+            const stock = Number(product.stock || 0);
+            const isLowStockNotified = product.isLowStockNotified || false;
+
+            // 🚨 Kịch bản 1: Sập bẫy (Tồn kho <= 5 và CHƯA báo động)
+            if (stock <= 5 && !isLowStockNotified) {
+                console.log(`⚠️ CẢNH BÁO: ${product.name} sắp hết (${stock} hộp). Đang reo chuông!`);
+                
+                try {
+                    // 1. Reo chuông trên Web Admin
+                    await db.collection('notifications').add({
+                        title: "CẢNH BÁO KHO HÀNG ⚠️",
+                        message: `Sản phẩm ${product.name} chỉ còn ${stock} hộp! Vui lòng kiểm tra và nhập thêm.`,
+                        type: "INVENTORY",
+                        targetId: productId, // Truyền ID để Admin click vào bay đến SP
+                        targetRoles: ['ADMIN', 'INVENTORY'], // Sếp và Thủ kho sẽ thấy
+                        readBy: [],
+                        createdAt: Date.now()
+                    });
+
+                    // 2. Chốt bẫy (Đánh dấu đã báo động để không spam)
+                    await db.collection('products').doc(productId).update({
+                        isLowStockNotified: true
+                    });
+                    console.log(`🔒 Đã chốt bẫy cảnh báo cho ${product.name}`);
+                } catch (error) {
+                    console.error("Lỗi khi reo chuông kho hàng:", error);
+                }
+            }
+            
+            // 🟢 Kịch bản 2: Cài lại bẫy (Khách hủy đơn HOẶC Thủ kho nhập thêm hàng > 5)
+            if (stock > 5 && isLowStockNotified) {
+                console.log(`✅ Tồn kho ${product.name} đã an toàn (${stock} hộp). Đang cài lại bẫy!`);
+                try {
+                    await db.collection('products').doc(productId).update({
+                        isLowStockNotified: false
+                    });
+                } catch (error) {
+                    console.error("Lỗi khi cài lại bẫy kho hàng:", error);
+                }
+            }
+        }
+    });
+}, (error) => {
+    console.error("Lỗi Lính Gác Kho:", error);
+});
 // ==========================================
 // KHỞI ĐỘNG SERVER
 // ==========================================
