@@ -24,11 +24,13 @@ const payos = new PayOS({
 const app = express();
 app.use(cors());
 app.use(express.json());
+
 app.get('/', (req, res) => {
     res.status(200).send('Gunpla Server is awake and running!');
 });
+
 // ==========================================
-// API 1: TẠO LINK THANH TOÁN (Giữ nguyên)
+// API 1: TẠO LINK THANH TOÁN
 // ==========================================
 app.post('/create-payment-link', async (req, res) => {
     try {
@@ -57,7 +59,7 @@ app.post('/create-payment-link', async (req, res) => {
 });
 
 // ==========================================
-// API 2: NHẬN WEBHOOK TỪ PAYOS (Nâng cấp)
+// API 2: NHẬN WEBHOOK TỪ PAYOS
 // ==========================================
 app.post('/payos-webhook', async (req, res) => {
     try {
@@ -87,12 +89,11 @@ app.post('/payos-webhook', async (req, res) => {
                 await batch.commit();
                 console.log("🎉 Cập nhật trạng thái PAID thành công!");
 
-                // 2. 🌟 TỰ ĐỘNG BÁO CHUÔNG CHO WEB ADMIN
-                // Vì server đã có quyền Admin, tội gì không báo luôn cho Web!
+                // 2. TỰ ĐỘNG BÁO CHUÔNG CHO WEB ADMIN
                 await db.collection('notifications').add({
                     title: `Thanh toán thành công #${orderId}`,
                     message: `Đơn hàng #${orderId} đã được thanh toán qua PayOS.`,
-                    targetRoles: ['ADMIN', 'INVENTORY'], // Sếp và Thủ kho sẽ nhận được
+                    targetRoles: ['ADMIN', 'INVENTORY'], 
                     readBy: [],
                     createdAt: Date.now()
                 });
@@ -103,32 +104,36 @@ app.post('/payos-webhook', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error("❌ Lỗi xử lý Webhook:", error.message);
-        res.json({ success: false });
+        res.json({ success: false }); // Trả về false để PayOS biết đường gọi lại nếu cần
     }
 });
 
 // ==========================================
-// API 3: BẮN THÔNG BÁO FCM (MỚI THÊM)
-// Thay thế hoàn toàn NotificationHelper.kt trên Android
+// API 3: BẮN THÔNG BÁO FCM (ĐÃ FIX CHUẨN 100%)
+// Chống sập Server 500, Hỗ trợ DeepLink mở App
 // ==========================================
 app.post('/api/send-fcm', async (req, res) => {
-    const { targetToken, topic, title, body, type, orderId, action } = req.body;
+    // 🌟 Lấy ĐẦY ĐỦ các trường từ Android / Web gửi lên
+    const { targetToken, topic, title, body, type, orderId, action, channelId, imageUrl } = req.body;
 
     if (!targetToken && !topic) {
         return res.status(400).json({ success: false, error: "Thiếu FCM Token hoặc Topic" });
     }
 
     try {
-        // Gói dữ liệu gửi đi
+        // Gói dữ liệu gửi đi (Payload)
         const payload = {
             notification: { 
-                title: title, 
-                body: body 
+                title: title || 'Thông báo mới', 
+                body: body || 'Bạn có một thông báo từ hệ thống'
             },
             data: { 
-                type: type || 'SYSTEM', 
-                orderId: orderId || '',
-                action: action || ''
+                // 🌟 BẮT BUỘC ÉP KIỂU STRING() CHO FIREBASE ADMIN TRÁNH CRASH 500
+                type: String(type || 'SYSTEM'), 
+                orderId: String(orderId || ''),
+                action: String(action || ''),
+                channelId: String(channelId || ''),
+                imageUrl: String(imageUrl || '')
             }
         };
 
@@ -145,11 +150,12 @@ app.post('/api/send-fcm', async (req, res) => {
         
         res.status(200).json({ success: true, message: "Đã gửi thông báo FCM!" });
     } catch (error) {
-        console.error('❌ Lỗi khi bắn FCM:', error);
-        res.status(500).json({ success: false, error: error.message });
+        // 🌟 BẮT LỖI TẠI ĐÂY ĐỂ KHÔNG BỊ SẬP SERVER TRẢ VỀ 500
+        console.error('❌ Lỗi khi bắn FCM (Có thể do Token sai/cũ):', error.message);
+        // Trả về 400 (Bad Request) để client biết Token hỏng, server vẫn sống khỏe
+        res.status(400).json({ success: false, error: error.message });
     }
 });
-// ... (Các API ở trên giữ nguyên)
 
 // ==========================================
 // 4. LÍNH GÁC KHO (AUTO LOW STOCK ALERT)
@@ -188,7 +194,7 @@ db.collection('products').onSnapshot((snapshot) => {
                     });
                     console.log(`🔒 Đã chốt bẫy cảnh báo cho ${product.name}`);
                 } catch (error) {
-                    console.error("Lỗi khi reo chuông kho hàng:", error);
+                    console.error("❌ Lỗi khi reo chuông kho hàng:", error);
                 }
             }
             
@@ -200,18 +206,19 @@ db.collection('products').onSnapshot((snapshot) => {
                         isLowStockNotified: false
                     });
                 } catch (error) {
-                    console.error("Lỗi khi cài lại bẫy kho hàng:", error);
+                    console.error("❌ Lỗi khi cài lại bẫy kho hàng:", error);
                 }
             }
         }
     });
 }, (error) => {
-    console.error("Lỗi Lính Gác Kho:", error);
+    console.error("❌ Lỗi Lính Gác Kho:", error);
 });
+
 // ==========================================
 // KHỞI ĐỘNG SERVER
 // ==========================================
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server Gunpla Backend đang chạy tại cổng ${PORT}`);
 });
