@@ -124,11 +124,13 @@ app.post('/api/send-fcm', async (req, res) => {
         // Gói dữ liệu gửi đi (Payload)
         const payload = {
             notification: { 
-                title: title || 'Thông báo mới', 
-                body: body || 'Bạn có một thông báo từ hệ thống'
+                title: String(title || 'Thông báo mới'), 
+                body: String(body || 'Bạn có một thông báo từ hệ thống')
             },
             data: { 
-                // 🌟 BẮT BUỘC ÉP KIỂU STRING() CHO FIREBASE ADMIN TRÁNH CRASH 500
+                // 🌟 THÊM 2 DÒNG NÀY VÀO CỤC DATA ĐỂ APP ĐỌC ĐƯỢC LÚC ĐANG MỞ
+                title: String(title || 'Thông báo mới'),                   // 👈 BẠN ĐANG THIẾU DÒNG NÀY
+                body: String(body || 'Bạn có một thông báo từ hệ thống'),  // 👈 BẠN ĐANG THIẾU DÒNG NÀY
                 type: String(type || 'SYSTEM'), 
                 orderId: String(orderId || ''),
                 action: String(action || ''),
