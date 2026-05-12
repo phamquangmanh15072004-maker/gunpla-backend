@@ -72,57 +72,69 @@ app.post('/create-payment-link', async (req, res) => {
     }
 });
 // ==========================================
-// API 2: NHẬN WEBHOOK TỪ PAYOS (GIẢI MÃ ID)
+// API 2: NHẬN WEBHOOK TỪ PAYOS (ĐÃ FIX GẠCH NỢ CHUẨN)
 // ==========================================
 app.post('/payos-webhook', async (req, res) => {
     try {
+        console.log("🔥 Đã nhận được Webhook từ PayOS!");
+
         const data = req.body.data;
         if (!data) return res.json({ success: true });
 
-        // Kiểm tra trạng thái thành công
         if (req.body.code === "00" || req.body.success === true) {
-            const payosOrderCode = String(data.orderCode); 
-            
-            // 🌟 GIẢI MÃ: Nếu mã dài hơn 9 số (do bị nối đuôi), cắt lấy 9 số đầu
-            const originalOrderId = payosOrderCode.length > 9 
-                ? payosOrderCode.substring(0, 9) 
-                : payosOrderCode;
+            let orderId = String(data.orderCode); 
 
-            console.log(`✅ Webhook: Nhận tiền đơn ${payosOrderCode}. Tìm ID gốc: ${originalOrderId}`);
+            // Giải mã thủ thuật nối đuôi (Cắt lấy 9 số gốc)
+            if (orderId.length > 9) {
+                orderId = orderId.substring(0, 9);
+            }
+
+            console.log(`✅ Khách đã chuyển tiền. ID Đơn gốc cần duyệt là: ${orderId}`);
 
             const ordersRef = db.collection('orders');
-            const snapshot = await ordersRef.where('id', '==', originalOrderId).get();
+            
+            // 🌟 CẢI TIẾN: Tìm theo cả Document ID và Field ID để chắc chắn 100% trúng đơn
+            let docRef = ordersRef.doc(orderId);
+            let docSnap = await docRef.get();
 
-            if (snapshot.empty) {
-                console.log(`❌ Lỗi: Không tìm thấy đơn ${originalOrderId} trên Firestore`);
+            let updateData = {
+                paymentStatus: 'PAID', 
+                status: 'PENDING', // 🌟 QUAN TRỌNG: Đẩy đơn sang Tab "Chờ xác nhận"
+                updatedAt: Date.now()
+            };
+
+            if (docSnap.exists) {
+                await docRef.update(updateData);
+                console.log("🎉 Đã gạch nợ (Theo Document ID) thành công!");
             } else {
+                // Nếu không tìm thấy Document ID, thử tìm theo trường 'id'
+                const snapshot = await ordersRef.where('id', '==', orderId).get();
+                if (snapshot.empty) {
+                    console.log(`❌ CẢNH BÁO: Firebase hoàn toàn không có đơn hàng ID = ${orderId}`);
+                    return res.json({ success: true });
+                }
                 const batch = db.batch();
-                snapshot.forEach(doc => {
-                    batch.update(doc.ref, {
-                        paymentStatus: 'PAID', 
-                        updatedAt: Date.now()
-                    });
-                });
+                snapshot.forEach(doc => batch.update(doc.ref, updateData));
                 await batch.commit();
-                console.log(`🎉 Đã gạch nợ thành công đơn gốc: ${originalOrderId}`);
-
-                // Báo chuông cho Admin
-                await db.collection('notifications').add({
-                    title: `Thanh toán thành công #${originalOrderId}`,
-                    message: `Đơn hàng #${originalOrderId} đã được thanh toán.`,
-                    targetRoles: ['ADMIN', 'INVENTORY'], 
-                    readBy: [],
-                    createdAt: Date.now()
-                });
+                console.log("🎉 Đã gạch nợ (Theo Field ID) thành công!");
             }
+
+            // Báo chuông cho Admin
+            await db.collection('notifications').add({
+                title: `Thanh toán thành công #${orderId}`,
+                message: `Đơn hàng #${orderId} đã được thanh toán qua PayOS.`,
+                targetRoles: ['ADMIN', 'INVENTORY'], 
+                readBy: [],
+                createdAt: Date.now()
+            });
         }
+
         res.json({ success: true });
     } catch (error) {
-        console.error("❌ Lỗi Webhook:", error.message);
-        res.json({ success: false });
+        console.error("❌ Lỗi xử lý Webhook:", error.message);
+        res.json({ success: false }); 
     }
 });
-
 // ==========================================
 // API 3: BẮN THÔNG BÁO FCM (ĐÃ FIX CHUẨN 100%)
 // Chống sập Server 500, Hỗ trợ DeepLink mở App
