@@ -31,26 +31,30 @@ app.get('/', (req, res) => {
 
 
 // ==========================================
-// API 1: TẠO LINK THANH TOÁN (BẢN CHUẨN CUỐI CÙNG)
-// Xử lý mượt mà lỗi 231 (Đã tồn tại) và tự động làm mới QR
+// API 1: TẠO LINK THANH TOÁN (VERSION CHUYÊN GIA)
 // ==========================================
 app.post('/create-payment-link', async (req, res) => {
     try {
-        const body = req.body; 
-        const orderCodeNum = Number(body.orderId); // Bắt buộc ép về Số (Number) cho PayOS
+        const body = req.body;
+        const originalId = String(body.orderId); // ID 9 số từ Android
+
+        // 🌟 CHIẾN THUẬT: Luôn tạo ra một số mới để PayOS không bao giờ báo lỗi 231
+        // Công thức: ID gốc + 3 số ngẫu nhiên (tạo thành chuỗi 12 số)
+        const randomSuffix = Math.floor(100 + Math.random() * 900); 
+        const uniqueOrderCode = Number(originalId + randomSuffix);
 
         const requestData = {
-            orderCode: orderCodeNum, 
+            orderCode: uniqueOrderCode, 
             amount: Number(body.amount),     
-            description: body.description || "Thanh toan don",
+            description: `Don hang ${originalId}`, // Để description ngắn gọn, dễ nhìn
             cancelUrl: "https://google.com", 
             returnUrl: "https://google.com"  
         };
 
-        // 1. Thử tạo link thanh toán mới
+        console.log(`📡 Đang tạo link PayOS với mã Unique: ${uniqueOrderCode} (Gốc: ${originalId})`);
+
         const paymentLinkRes = await payos.paymentRequests.create(requestData);
 
-        // Nếu tạo thành công ngay lần đầu -> Trả về cho App
         return res.status(200).json({
             success: true,
             checkoutUrl: paymentLinkRes.checkoutUrl,
@@ -60,88 +64,38 @@ app.post('/create-payment-link', async (req, res) => {
         });
 
     } catch (error) {
-        // 2. BẮT LỖI: Kiểm tra xem có phải lỗi 231 (Đơn đã tồn tại) không?
-        const isExistError = error.code === '231' || (error.message && error.message.includes('231'));
-
-        if (isExistError) {
-            console.log(`⚠️ Đơn ${req.body.orderId} bị lỗi 231. Đang HỦY phiên cũ và cấp mã QR mới...`);
-            
-            try {
-                const orderCodeNum = Number(req.body.orderId);
-                const cancelReason = "Khach muon tao lai QR"; // BẮT BUỘC LÀ CHUỖI STRING NGẮN
-
-                // 🌟 BƯỚC A: Hủy phiên thanh toán cũ bị treo
-                // Thử cú pháp của SDK bản mới nhất trước
-                try {
-                    await payos.paymentRequests.cancel(orderCodeNum, cancelReason);
-                } catch (cancelErr) {
-                    // Dự phòng nếu dùng SDK bản cũ hơn
-                    if (typeof payos.cancelPaymentLink === 'function') {
-                        await payos.cancelPaymentLink(orderCodeNum, cancelReason);
-                    } else {
-                        console.error("Lỗi Hủy đơn PayOS:", cancelErr.message);
-                    }
-                }
-
-                // 🌟 BƯỚC B: Yêu cầu PayOS tạo lại 1 mã QR mới tinh
-                const requestDataRetry = {
-                    orderCode: orderCodeNum, 
-                    amount: Number(req.body.amount),     
-                    description: req.body.description || "Thanh toan don",
-                    cancelUrl: "https://google.com", 
-                    returnUrl: "https://google.com"  
-                };
-                
-                const newPaymentLinkRes = await payos.paymentRequests.create(requestDataRetry);
-                console.log("✅ Đã cấp lại mã QR mới thành công!");
-                
-                // Trả mã QR mới về cho App Android
-                return res.status(200).json({
-                    success: true,
-                    checkoutUrl: newPaymentLinkRes.checkoutUrl,
-                    bin: newPaymentLinkRes.bin,
-                    accountNumber: newPaymentLinkRes.accountNumber,
-                    description: newPaymentLinkRes.description 
-                });
-
-            } catch (retryError) {
-                console.error("❌ Lỗi khi làm mới mã QR:", retryError.message);
-                return res.status(200).json({ 
-                    success: false, 
-                    message: "Không thể làm mới mã QR: " + retryError.message 
-                });
-            }
-        }
-
-        // 3. Nếu là lỗi khác (Ví dụ: sai định dạng tiền, mất mạng...)
-        console.error("❌ Lỗi tạo link thanh toán:", error.message);
+        console.error("❌ Lỗi tạo link PayOS:", error.message);
         return res.status(200).json({ 
             success: false, 
-            message: "Lỗi Server: " + error.message 
+            message: "Không thể tạo link thanh toán: " + error.message 
         });
     }
 });
 // ==========================================
-// API 2: NHẬN WEBHOOK TỪ PAYOS
+// API 2: NHẬN WEBHOOK TỪ PAYOS (GIẢI MÃ ID)
 // ==========================================
 app.post('/payos-webhook', async (req, res) => {
     try {
-        console.log("🔥 Đã nhận được Webhook từ PayOS!");
-
         const data = req.body.data;
         if (!data) return res.json({ success: true });
 
+        // Kiểm tra trạng thái thành công
         if (req.body.code === "00" || req.body.success === true) {
-            const orderId = String(data.orderCode); 
-            console.log(`✅ Khách đã chuyển tiền cho đơn: ${orderId}.`);
+            const payosOrderCode = String(data.orderCode); 
+            
+            // 🌟 GIẢI MÃ: Nếu mã dài hơn 9 số (do bị nối đuôi), cắt lấy 9 số đầu
+            const originalOrderId = payosOrderCode.length > 9 
+                ? payosOrderCode.substring(0, 9) 
+                : payosOrderCode;
+
+            console.log(`✅ Webhook: Nhận tiền đơn ${payosOrderCode}. Tìm ID gốc: ${originalOrderId}`);
 
             const ordersRef = db.collection('orders');
-            const snapshot = await ordersRef.where('id', '==', orderId).get();
+            const snapshot = await ordersRef.where('id', '==', originalOrderId).get();
 
             if (snapshot.empty) {
-                console.log(`❌ CẢNH BÁO: Firebase không có đơn hàng mang id = ${orderId}`);
+                console.log(`❌ Lỗi: Không tìm thấy đơn ${originalOrderId} trên Firestore`);
             } else {
-                // 1. Cập nhật trạng thái đơn hàng
                 const batch = db.batch();
                 snapshot.forEach(doc => {
                     batch.update(doc.ref, {
@@ -150,24 +104,22 @@ app.post('/payos-webhook', async (req, res) => {
                     });
                 });
                 await batch.commit();
-                console.log("🎉 Cập nhật trạng thái PAID thành công!");
+                console.log(`🎉 Đã gạch nợ thành công đơn gốc: ${originalOrderId}`);
 
-                // 2. TỰ ĐỘNG BÁO CHUÔNG CHO WEB ADMIN
+                // Báo chuông cho Admin
                 await db.collection('notifications').add({
-                    title: `Thanh toán thành công #${orderId}`,
-                    message: `Đơn hàng #${orderId} đã được thanh toán qua PayOS.`,
+                    title: `Thanh toán thành công #${originalOrderId}`,
+                    message: `Đơn hàng #${originalOrderId} đã được thanh toán.`,
                     targetRoles: ['ADMIN', 'INVENTORY'], 
                     readBy: [],
                     createdAt: Date.now()
                 });
-                console.log("🔔 Đã reo chuông cho Web Admin!");
             }
         }
-
         res.json({ success: true });
     } catch (error) {
-        console.error("❌ Lỗi xử lý Webhook:", error.message);
-        res.json({ success: false }); // Trả về false để PayOS biết đường gọi lại nếu cần
+        console.error("❌ Lỗi Webhook:", error.message);
+        res.json({ success: false });
     }
 });
 
