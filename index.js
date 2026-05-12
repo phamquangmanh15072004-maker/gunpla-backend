@@ -30,31 +30,75 @@ app.get('/', (req, res) => {
 });
 
 // ==========================================
-// API 1: TẠO LINK THANH TOÁN
+// API 1: TẠO LINK THANH TOÁN (ĐÃ FIX LỖI 231 CHUẨN 100%)
+// Tự động làm mới QR Code mà không tạo đơn hàng rác
 // ==========================================
 app.post('/create-payment-link', async (req, res) => {
     try {
         const body = req.body; 
+        const orderCodeNum = Number(body.orderId); // Phải ép về số cho PayOS
+
         const requestData = {
-            orderCode: Number(body.orderId), 
+            orderCode: orderCodeNum, 
             amount: Number(body.amount),     
             description: body.description || "Thanh toan don hang",
             cancelUrl: "https://google.com", 
             returnUrl: "https://google.com"  
         };
 
+        // 1. Thử tạo link thanh toán mới
         const paymentLinkRes = await payos.paymentRequests.create(requestData);
 
-        res.json({
+        // Trả về nếu thành công ngay lần đầu
+        return res.json({
             success: true,
             checkoutUrl: paymentLinkRes.checkoutUrl,
             bin: paymentLinkRes.bin,
             accountNumber: paymentLinkRes.accountNumber,
             description: paymentLinkRes.description 
         });
+
     } catch (error) {
+        // 2. BẮT LỖI: Kiểm tra xem có phải lỗi 231 (Đã tồn tại) không?
+        const isExistError = error.code === '231' || (error.message && error.message.includes('231'));
+
+        if (isExistError) {
+            console.log(`⚠️ Đơn ${req.body.orderId} bị lỗi 231. Đang làm mới phiên giao dịch PayOS...`);
+            
+            try {
+                // Bước A: Bảo PayOS HỦY cái mã QR cũ bị treo đi (Không ảnh hưởng Firebase)
+                await payos.cancelPaymentLink(Number(req.body.orderId), "Khách yêu cầu mã QR mới");
+
+                // Bước B: Yêu cầu PayOS cấp lại 1 mã QR mới tinh cho CHÍNH ĐƠN HÀNG ĐÓ
+                const requestDataRetry = {
+                    orderCode: Number(req.body.orderId), 
+                    amount: Number(req.body.amount),     
+                    description: req.body.description || "Thanh toan don hang",
+                    cancelUrl: "https://google.com", 
+                    returnUrl: "https://google.com"  
+                };
+                
+                const newPaymentLinkRes = await payos.paymentRequests.create(requestDataRetry);
+
+                console.log("✅ Đã làm mới mã QR thành công cho App Android!");
+                
+                // Trả mã QR mới về cho điện thoại
+                return res.json({
+                    success: true,
+                    checkoutUrl: newPaymentLinkRes.checkoutUrl,
+                    bin: newPaymentLinkRes.bin,
+                    accountNumber: newPaymentLinkRes.accountNumber,
+                    description: newPaymentLinkRes.description 
+                });
+
+            } catch (retryError) {
+                console.error("❌ Lỗi khi làm mới mã QR:", retryError.message);
+                return res.status(500).json({ success: false, message: "Không thể tạo mã QR mới: " + retryError.message });
+            }
+        }
+
         console.error("❌ Lỗi tạo link:", error);
-        res.status(500).json({ success: false, message: error.message });
+        return res.status(500).json({ success: false, message: error.message });
     }
 });
 
