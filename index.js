@@ -243,7 +243,88 @@ db.collection('products').onSnapshot((snapshot) => {
 }, (error) => {
     console.error("❌ Lỗi Lính Gác Kho:", error);
 });
+// ==========================================
+// 5. LÍNH ĐI TUẦN (CRON JOB): TỰ ĐỘNG HỦY ĐƠN QUÁ 5 PHÚT VÀ HOÀN KHO
+// ==========================================
+console.log("🕵️‍♂️ Đang triển khai Lính đi tuần (Quét đơn rác mỗi phút)...");
 
+// Chạy vòng lặp cứ 60 giây (60.000 ms) sẽ thực thi 1 lần
+setInterval(async () => {
+    try {
+        const now = Date.now();
+        const timeLimit = 5 * 60 * 1000; // 5 phút
+
+        const ordersRef = db.collection('orders');
+        // Chỉ lấy những đơn đang chờ thanh toán
+        const snapshot = await ordersRef.where('status', '==', 'AWAITING_PAYMENT').get();
+
+        if (snapshot.empty) return; // Không có đơn nào chờ thanh toán thì thôi
+
+        // Biến gom các thao tác để chạy 1 lần cho tối ưu
+        const batch = db.batch();
+        let canceledCount = 0;
+
+        // Dùng vòng lặp for...of để có thể dùng await bên trong (nếu cần hủy PayOS)
+        for (const doc of snapshot.docs) {
+            const order = doc.data();
+            const orderId = order.id;
+            const createdAt = order.createdAt;
+
+            // Kiểm tra: Đã trôi qua bao lâu từ lúc tạo đơn?
+            if (now - createdAt > timeLimit) {
+                console.log(`⏳ Phát hiện đơn ${orderId} đã quá hạn 5 phút. Tiến hành Hủy & Hoàn kho...`);
+
+                // 🌟 1. Cập nhật trạng thái Đơn hàng thành ĐÃ HỦY
+                batch.update(doc.ref, {
+                    status: 'CANCELLED',
+                    cancelReason: 'Hệ thống tự động hủy do quá 5 phút không thanh toán',
+                    updatedAt: now
+                });
+
+                // 🌟 2. HOÀN KHO TỰ ĐỘNG (RẤT QUAN TRỌNG)
+                if (order.items && Array.isArray(order.items)) {
+                    order.items.forEach(item => {
+                        // Lấy ID sản phẩm (tùy cấu trúc DB của bạn, có thể là item.product.id hoặc item.productId)
+                        const productId = item.product ? item.product.id : item.productId;
+                        const quantityToRestore = Number(item.quantity);
+
+                        if (productId && quantityToRestore > 0) {
+                            const productRef = db.collection('products').doc(productId);
+                            // Dùng increment để cộng dồn lại số lượng vào kho
+                            batch.update(productRef, {
+                                stock: admin.firestore.FieldValue.increment(quantityToRestore)
+                            });
+                        }
+                    });
+                }
+
+                // 🌟 3. BÁO CHO PAYOS: HỦY PHIÊN THANH TOÁN (Tránh khách thanh toán trễ)
+                try {
+                    const orderCodeNum = Number(orderId);
+                    // Dùng Try-Catch bao bọc hàm này lại để lỡ PayOS lỗi thì Server ko sập
+                    if (typeof payos.paymentRequests.cancel === 'function') {
+                        await payos.paymentRequests.cancel(orderCodeNum, "Qua 5 phut he thong huy");
+                    } else if (typeof payos.cancelPaymentLink === 'function') {
+                        await payos.cancelPaymentLink(orderCodeNum, "Qua 5 phut he thong huy");
+                    }
+                } catch (payosError) {
+                    console.log(`⚠️ Bỏ qua Hủy PayOS cho đơn ${orderId}: ${payosError.message}`);
+                }
+
+                canceledCount++;
+            }
+        }
+
+        // Nếu có đơn bị trảm thì Commit (thực thi) toàn bộ lệnh Update Firebase cùng 1 lúc
+        if (canceledCount > 0) {
+            await batch.commit();
+            console.log(`🗑️ Đã dọn dẹp thành công ${canceledCount} đơn hàng quá hạn!`);
+        }
+
+    } catch (error) {
+        console.error("❌ Lỗi hệ thống Lính đi tuần:", error.message);
+    }
+}, 60 * 1000); // 60 giây chạy 1 lần
 // ==========================================
 // KHỞI ĐỘNG SERVER
 // ==========================================
