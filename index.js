@@ -33,6 +33,9 @@ app.get('/', (req, res) => {
 // API 1: TẠO LINK THANH TOÁN (ĐÃ FIX LỖI 231 CHUẨN 100%)
 // Tự động làm mới QR Code mà không tạo đơn hàng rác
 // ==========================================
+// ==========================================
+// API 1: TẠO LINK THANH TOÁN (ĐÃ FIX CHUẨN 231 + TÁI SỬ DỤNG LINK)
+// ==========================================
 app.post('/create-payment-link', async (req, res) => {
     try {
         const body = req.body; 
@@ -47,9 +50,9 @@ app.post('/create-payment-link', async (req, res) => {
         };
 
         // 1. Thử tạo link thanh toán mới
+        // (Vẫn giữ hàm create cũ của bạn vì nó đang chạy tốt)
         const paymentLinkRes = await payos.paymentRequests.create(requestData);
 
-        // Trả về nếu thành công ngay lần đầu
         return res.json({
             success: true,
             checkoutUrl: paymentLinkRes.checkoutUrl,
@@ -59,49 +62,49 @@ app.post('/create-payment-link', async (req, res) => {
         });
 
     } catch (error) {
-        // 2. BẮT LỖI: Kiểm tra xem có phải lỗi 231 (Đã tồn tại) không?
+        // 2. BẮT LỖI 231: Nếu đơn đã tồn tại
         const isExistError = error.code === '231' || (error.message && error.message.includes('231'));
 
         if (isExistError) {
-            console.log(`⚠️ Đơn ${req.body.orderId} bị lỗi 231. Đang làm mới phiên giao dịch PayOS...`);
+            console.log(`⚠️ Đơn ${req.body.orderId} bị lỗi 231. Đang lấy lại thông tin link cũ...`);
             
             try {
-                // Bước A: Bảo PayOS HỦY cái mã QR cũ bị treo đi (Không ảnh hưởng Firebase)
-                await payos.cancelPaymentLink(Number(req.body.orderId), "Khách yêu cầu mã QR mới");
+                let existingLink;
+                const orderCodeNum = Number(req.body.orderId);
 
-                // Bước B: Yêu cầu PayOS cấp lại 1 mã QR mới tinh cho CHÍNH ĐƠN HÀNG ĐÓ
-                const requestDataRetry = {
-                    orderCode: Number(req.body.orderId), 
-                    amount: Number(req.body.amount),     
-                    description: req.body.description || "Thanh toan don hang",
-                    cancelUrl: "https://google.com", 
-                    returnUrl: "https://google.com"  
-                };
-                
-                const newPaymentLinkRes = await payos.paymentRequests.create(requestDataRetry);
+                // 🌟 QUÉT QUA CÁC HÀM CỦA CÁC VERSION PAYOS ĐỂ LẤY THÔNG TIN
+                if (typeof payos.getPaymentLinkInformation === 'function') {
+                    existingLink = await payos.getPaymentLinkInformation(orderCodeNum);
+                } else if (payos.paymentRequests && typeof payos.paymentRequests.getPaymentLinkInformation === 'function') {
+                    existingLink = await payos.paymentRequests.getPaymentLinkInformation(orderCodeNum);
+                } else if (payos.paymentRequests && typeof payos.paymentRequests.get === 'function') {
+                    existingLink = await payos.paymentRequests.get(orderCodeNum);
+                } else {
+                    throw new Error("Version SDK PayOS này không hỗ trợ hàm lấy thông tin đơn.");
+                }
 
-                console.log("✅ Đã làm mới mã QR thành công cho App Android!");
+                console.log("✅ Đã lấy lại mã QR cũ thành công!");
                 
-                // Trả mã QR mới về cho điện thoại
+                // Trả thông tin mã QR CŨ về cho App Android
                 return res.json({
                     success: true,
-                    checkoutUrl: newPaymentLinkRes.checkoutUrl,
-                    bin: newPaymentLinkRes.bin,
-                    accountNumber: newPaymentLinkRes.accountNumber,
-                    description: newPaymentLinkRes.description 
+                    checkoutUrl: existingLink.checkoutUrl,
+                    bin: existingLink.bin || "970422", // Đề phòng thiếu bin
+                    accountNumber: existingLink.accountNumber,
+                    description: existingLink.description 
                 });
 
-            } catch (retryError) {
-                console.error("❌ Lỗi khi làm mới mã QR:", retryError.message);
-                return res.status(500).json({ success: false, message: "Không thể tạo mã QR mới: " + retryError.message });
+            } catch (getInfoError) {
+                console.error("❌ Lỗi khi lấy lại mã QR:", getInfoError.message);
+                return res.status(500).json({ success: false, message: "Không thể lấy lại mã QR: " + getInfoError.message });
             }
         }
 
-        console.error("❌ Lỗi tạo link:", error);
+        // 3. Nếu là lỗi khác
+        console.error("❌ Lỗi tạo link:", error.message);
         return res.status(500).json({ success: false, message: error.message });
     }
 });
-
 // ==========================================
 // API 2: NHẬN WEBHOOK TỪ PAYOS
 // ==========================================
