@@ -29,13 +29,7 @@ app.get('/', (req, res) => {
     res.status(200).send('Gunpla Server is awake and running!');
 });
 
-// ==========================================
-// API 1: TẠO LINK THANH TOÁN (ĐÃ FIX LỖI 231 CHUẨN 100%)
-// Tự động làm mới QR Code mà không tạo đơn hàng rác
-// ==========================================
-// ==========================================
-// API 1: TẠO LINK THANH TOÁN (ĐÃ FIX CHUẨN 231 + TÁI SỬ DỤNG LINK)
-// ==========================================
+
 app.post('/create-payment-link', async (req, res) => {
     try {
         const body = req.body; 
@@ -44,13 +38,11 @@ app.post('/create-payment-link', async (req, res) => {
         const requestData = {
             orderCode: orderCodeNum, 
             amount: Number(body.amount),     
-            description: body.description || "Thanh toan don hang",
+            description: body.description || "Thanh toan don",
             cancelUrl: "https://google.com", 
             returnUrl: "https://google.com"  
         };
 
-        // 1. Thử tạo link thanh toán mới
-        // (Vẫn giữ hàm create cũ của bạn vì nó đang chạy tốt)
         const paymentLinkRes = await payos.paymentRequests.create(requestData);
 
         return res.json({
@@ -62,45 +54,41 @@ app.post('/create-payment-link', async (req, res) => {
         });
 
     } catch (error) {
-        // 2. BẮT LỖI 231: Nếu đơn đã tồn tại
-        const isExistError = error.code === '231' || (error.message && error.message.includes('231'));
-
-        if (isExistError) {
-            console.log(`⚠️ Đơn ${req.body.orderId} bị lỗi 231. Đang lấy lại thông tin link cũ...`);
-            
+        // Nếu lỗi 231 (Đã tồn tại)
+        if (error.code === '231' || (error.message && error.message.includes('231'))) {
+            console.log(`⚠️ Đơn ${req.body.orderId} bị lỗi 231. Tiến hành HỦY phiên cũ và tạo lại...`);
             try {
-                let existingLink;
                 const orderCodeNum = Number(req.body.orderId);
-
-                // 🌟 QUÉT QUA CÁC HÀM CỦA CÁC VERSION PAYOS ĐỂ LẤY THÔNG TIN
-                if (typeof payos.getPaymentLinkInformation === 'function') {
-                    existingLink = await payos.getPaymentLinkInformation(orderCodeNum);
-                } else if (payos.paymentRequests && typeof payos.paymentRequests.getPaymentLinkInformation === 'function') {
-                    existingLink = await payos.paymentRequests.getPaymentLinkInformation(orderCodeNum);
-                } else if (payos.paymentRequests && typeof payos.paymentRequests.get === 'function') {
-                    existingLink = await payos.paymentRequests.get(orderCodeNum);
-                } else {
-                    throw new Error("Version SDK PayOS này không hỗ trợ hàm lấy thông tin đơn.");
-                }
-
-                console.log("✅ Đã lấy lại mã QR cũ thành công!");
                 
-                // Trả thông tin mã QR CŨ về cho App Android
+                // 🌟 FIX QUAN TRỌNG NHẤT: Gọi hàm Hủy phiên giao dịch cũ (Đúng cú pháp V2)
+                await payos.paymentRequests.cancel(orderCodeNum, { cancellationReason: "Khach doi ma QR" });
+
+                // Yêu cầu PayOS tạo lại 1 mã mới
+                const requestDataRetry = {
+                    orderCode: orderCodeNum, 
+                    amount: Number(req.body.amount),     
+                    description: req.body.description || "Thanh toan don",
+                    cancelUrl: "https://google.com", 
+                    returnUrl: "https://google.com"  
+                };
+                
+                const newPaymentLinkRes = await payos.paymentRequests.create(requestDataRetry);
+                console.log("✅ Đã tạo mã QR mới thành công!");
+                
                 return res.json({
                     success: true,
-                    checkoutUrl: existingLink.checkoutUrl,
-                    bin: existingLink.bin || "970422", // Đề phòng thiếu bin
-                    accountNumber: existingLink.accountNumber,
-                    description: existingLink.description 
+                    checkoutUrl: newPaymentLinkRes.checkoutUrl,
+                    bin: newPaymentLinkRes.bin,
+                    accountNumber: newPaymentLinkRes.accountNumber,
+                    description: newPaymentLinkRes.description 
                 });
 
-            } catch (getInfoError) {
-                console.error("❌ Lỗi khi lấy lại mã QR:", getInfoError.message);
-                return res.status(500).json({ success: false, message: "Không thể lấy lại mã QR: " + getInfoError.message });
+            } catch (retryError) {
+                console.error("❌ Lỗi khi làm mới mã QR:", retryError.message);
+                return res.status(500).json({ success: false, message: "Lỗi làm mới: " + retryError.message });
             }
         }
 
-        // 3. Nếu là lỗi khác
         console.error("❌ Lỗi tạo link:", error.message);
         return res.status(500).json({ success: false, message: error.message });
     }
