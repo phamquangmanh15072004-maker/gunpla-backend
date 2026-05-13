@@ -36,17 +36,16 @@ app.get('/', (req, res) => {
 app.post('/create-payment-link', async (req, res) => {
     try {
         const body = req.body;
-        const originalId = String(body.orderId); // ID 9 số từ Android
+        const originalId = String(body.orderId);
 
-        // 🌟 CHIẾN THUẬT: Luôn tạo ra một số mới để PayOS không bao giờ báo lỗi 231
-        // Công thức: ID gốc + 3 số ngẫu nhiên (tạo thành chuỗi 12 số)
+        // 🌟 CHIẾN THUẬT NỐI ĐUÔI (Thêm 3 số ngẫu nhiên)
         const randomSuffix = Math.floor(100 + Math.random() * 900); 
         const uniqueOrderCode = Number(originalId + randomSuffix);
 
         const requestData = {
             orderCode: uniqueOrderCode, 
             amount: Number(body.amount),     
-            description: `Don hang ${originalId}`, // Để description ngắn gọn, dễ nhìn
+            description: `Don hang ${originalId}`,
             cancelUrl: "https://google.com", 
             returnUrl: "https://google.com"  
         };
@@ -65,10 +64,7 @@ app.post('/create-payment-link', async (req, res) => {
 
     } catch (error) {
         console.error("❌ Lỗi tạo link PayOS:", error.message);
-        return res.status(200).json({ 
-            success: false, 
-            message: "Không thể tạo link thanh toán: " + error.message 
-        });
+        return res.status(200).json({ success: false, message: "Không thể tạo link: " + error.message });
     }
 });
 // ==========================================
@@ -84,42 +80,37 @@ app.post('/payos-webhook', async (req, res) => {
         if (req.body.code === "00" || req.body.success === true) {
             let orderId = String(data.orderCode); 
 
-            // Giải mã thủ thuật nối đuôi (Cắt lấy 9 số gốc)
-            if (orderId.length > 9) {
-                orderId = orderId.substring(0, 9);
+            if (orderId.length > 3) {
+                orderId = orderId.substring(0, orderId.length - 3);
             }
 
             console.log(`✅ Khách đã chuyển tiền. ID Đơn gốc cần duyệt là: ${orderId}`);
 
             const ordersRef = db.collection('orders');
-            
-            // 🌟 CẢI TIẾN: Tìm theo cả Document ID và Field ID để chắc chắn 100% trúng đơn
             let docRef = ordersRef.doc(orderId);
             let docSnap = await docRef.get();
 
             let updateData = {
                 paymentStatus: 'PAID', 
-                status: 'PENDING', // 🌟 QUAN TRỌNG: Đẩy đơn sang Tab "Chờ xác nhận"
+                status: 'PENDING', 
                 updatedAt: Date.now()
             };
 
             if (docSnap.exists) {
                 await docRef.update(updateData);
-                console.log("🎉 Đã gạch nợ (Theo Document ID) thành công!");
+                console.log("🎉 Đã gạch nợ thành công!");
             } else {
-                // Nếu không tìm thấy Document ID, thử tìm theo trường 'id'
                 const snapshot = await ordersRef.where('id', '==', orderId).get();
                 if (snapshot.empty) {
-                    console.log(`❌ CẢNH BÁO: Firebase hoàn toàn không có đơn hàng ID = ${orderId}`);
+                    console.log(`❌ Lỗi: Firebase hoàn toàn không có đơn hàng ID = ${orderId}`);
                     return res.json({ success: true });
                 }
                 const batch = db.batch();
                 snapshot.forEach(doc => batch.update(doc.ref, updateData));
                 await batch.commit();
-                console.log("🎉 Đã gạch nợ (Theo Field ID) thành công!");
+                console.log("🎉 Đã gạch nợ thành công!");
             }
 
-            // Báo chuông cho Admin
             await db.collection('notifications').add({
                 title: `Thanh toán thành công #${orderId}`,
                 message: `Đơn hàng #${orderId} đã được thanh toán qua PayOS.`,
