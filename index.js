@@ -342,7 +342,7 @@ app.post('/payos-webhook', async (req, res) => {
 });
 
 app.post('/api/send-fcm', async (req, res) => {
-  const { targetToken, topic, title, body, type, orderId, action, channelId, imageUrl } = req.body;
+  const { targetToken, topic, title, body, type, orderId, action, channelId, postId, targetId, imageUrl } = req.body;
 
   if (!targetToken && !topic) {
     return res.status(400).json({ success: false, error: 'Missing FCM token or topic' });
@@ -359,6 +359,8 @@ app.post('/api/send-fcm', async (req, res) => {
         body: String(body || 'Ban co mot thong bao tu he thong'),
         type: String(type || 'SYSTEM'),
         orderId: String(orderId || ''),
+        postId: String(postId || ''),
+        targetId: String(targetId || ''),
         action: String(action || ''),
         channelId: String(channelId || ''),
         imageUrl: String(imageUrl || ''),
