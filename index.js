@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { PayOS } = require('@payos/node');
+const { GoogleAuth } = require('google-auth-library');
 
 const serviceAccount = require('./serviceAccountKey.json');
 
@@ -32,11 +33,19 @@ const RETURN_URL = process.env.PAYOS_RETURN_URL || 'https://google.com';
 const CANCEL_URL = process.env.PAYOS_CANCEL_URL || 'https://google.com';
 const PAYOS_REQUEST_TIMEOUT_MS = Number(process.env.PAYOS_REQUEST_TIMEOUT_MS || 20000);
 const FCM_REQUEST_TIMEOUT_MS = Number(process.env.FCM_REQUEST_TIMEOUT_MS || 10000);
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'gemini').trim().toLowerCase();
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
+const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
+const VERTEX_PROJECT_ID = (process.env.VERTEX_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || serviceAccount.project_id || '').trim();
+const VERTEX_LOCATION = (process.env.VERTEX_LOCATION || 'us-central1').trim();
+const VERTEX_MODEL = (process.env.VERTEX_MODEL || GEMINI_MODEL || 'gemini-2.5-flash').trim();
 const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 30000);
 const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 30);
 const AI_MAX_IMAGE_BYTES = Number(process.env.AI_MAX_IMAGE_BYTES || 5 * 1024 * 1024);
+const vertexAuth = new GoogleAuth({
+  scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+  credentials: serviceAccount,
+});
 
 function now() {
   return Date.now();
@@ -278,7 +287,122 @@ async function fetchImageAsInlineData(imageUrl) {
   }
 }
 
+function toVertexParts(parts) {
+  return parts.map((part) => {
+    if (part.inline_data) {
+      return {
+        inlineData: {
+          mimeType: part.inline_data.mime_type,
+          data: part.inline_data.data,
+        },
+      };
+    }
+    return part;
+  });
+}
+
+function normalizeAiHistoryForVertex(history) {
+  return normalizeAiHistory(history).map((item) => ({
+    role: item.role,
+    parts: toVertexParts(item.parts || []),
+  }));
+}
+
+async function callVertexGemini({ systemPrompt, history, message, imageUrl }) {
+  if (!VERTEX_PROJECT_ID) {
+    const error = new Error('Vertex AI project id is not configured');
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const userText = takeText(message, 8000);
+  const parts = [];
+  const inlineImage = await fetchImageAsInlineData(imageUrl);
+  if (inlineImage) parts.push(inlineImage);
+  if (userText) parts.push({ text: userText });
+
+  if (!parts.length) {
+    const error = new Error('Message or image is required');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const client = await vertexAuth.getClient();
+  const accessToken = await client.getAccessToken();
+  const token = typeof accessToken === 'string' ? accessToken : accessToken?.token;
+  if (!token) {
+    const error = new Error('Cannot get Vertex AI access token');
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  const endpoint = `https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(VERTEX_PROJECT_ID)}/locations/${encodeURIComponent(VERTEX_LOCATION)}/publishers/google/models/${encodeURIComponent(VERTEX_MODEL)}:generateContent`;
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: systemPrompt }],
+        },
+        contents: [
+          ...normalizeAiHistoryForVertex(history),
+          { role: 'user', parts: toVertexParts(parts) },
+        ],
+        generationConfig: {
+          temperature: 0.55,
+          topP: 0.9,
+          maxOutputTokens: 1400,
+        },
+      }),
+    });
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const messageText = data.error?.message || `Vertex Gemini request failed with ${response.status}`;
+      const error = new Error(messageText);
+      error.vertexStatus = data.error?.status || '';
+      error.statusCode = response.status >= 500 ? 503 : 400;
+      throw error;
+    }
+
+    const text = data.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text || '')
+      .join('')
+      .trim();
+
+    if (!text) {
+      const finishReason = data.candidates?.[0]?.finishReason || 'EMPTY_RESPONSE';
+      const error = new Error(`Vertex Gemini returned no text: ${finishReason}`);
+      error.statusCode = 502;
+      throw error;
+    }
+
+    return text;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      const timeoutError = new Error('Vertex Gemini request timed out');
+      timeoutError.statusCode = 504;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function callGemini({ systemPrompt, history, message, imageUrl }) {
+  if (AI_PROVIDER === 'vertex') {
+    return callVertexGemini({ systemPrompt, history, message, imageUrl });
+  }
+
   if (!GEMINI_API_KEY) {
     const error = new Error('Gemini API key is not configured');
     error.statusCode = 503;
@@ -305,7 +429,10 @@ async function callGemini({ systemPrompt, history, message, imageUrl }) {
     const response = await fetch(endpoint, {
       method: 'POST',
       signal: controller.signal,
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': GEMINI_API_KEY,
+      },
       body: JSON.stringify({
         system_instruction: {
           parts: [{ text: systemPrompt }],
@@ -326,6 +453,7 @@ async function callGemini({ systemPrompt, history, message, imageUrl }) {
     if (!response.ok) {
       const messageText = data.error?.message || `Gemini request failed with ${response.status}`;
       const error = new Error(messageText);
+      error.geminiStatus = data.error?.status || '';
       error.statusCode = response.status >= 500 ? 503 : 400;
       throw error;
     }
@@ -816,6 +944,20 @@ app.post('/api/ai/chat', async (req, res) => {
       message: status >= 500 ? 'AI service is temporarily unavailable' : error.message,
     });
   }
+});
+
+app.get('/api/ai/health', (req, res) => {
+  res.status(200).json({
+    success: true,
+    provider: AI_PROVIDER,
+    configured: AI_PROVIDER === 'vertex' ? Boolean(VERTEX_PROJECT_ID) : Boolean(GEMINI_API_KEY),
+    geminiApiConfigured: Boolean(GEMINI_API_KEY),
+    vertexConfigured: Boolean(VERTEX_PROJECT_ID),
+    model: AI_PROVIDER === 'vertex' ? VERTEX_MODEL : GEMINI_MODEL,
+    vertexProjectId: VERTEX_PROJECT_ID ? `${VERTEX_PROJECT_ID.slice(0, 4)}***` : '',
+    vertexLocation: VERTEX_LOCATION,
+    timeoutMs: GEMINI_TIMEOUT_MS,
+  });
 });
 
 console.log('Starting low stock watcher...');
