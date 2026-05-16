@@ -41,40 +41,65 @@ function parseServiceAccountJson(rawValue, sourceName) {
   }
 }
 
-function loadServiceAccount() {
-  const jsonEnvKeys = [
-    'GOOGLE_SERVICE_ACCOUNT_JSON',
-    'FIREBASE_SERVICE_ACCOUNT_JSON',
-    'VERTEX_SERVICE_ACCOUNT_JSON',
-    'GOOGLE_APPLICATION_CREDENTIALS_JSON',
-  ];
-
+function loadServiceAccount({ jsonEnvKeys, fileCandidates, label }) {
   for (const envKey of jsonEnvKeys) {
     const account = parseServiceAccountJson(process.env[envKey], envKey);
-    if (account) return account;
+    if (account) return { account, source: envKey };
   }
 
-  const fileCandidates = [
-    process.env.GOOGLE_APPLICATION_CREDENTIALS,
+  for (const candidate of fileCandidates.filter(Boolean)) {
+    const resolvedPath = path.isAbsolute(candidate) ? candidate : path.resolve(__dirname, candidate);
+    if (!fs.existsSync(resolvedPath)) continue;
+    return {
+      account: normalizeServiceAccount(JSON.parse(fs.readFileSync(resolvedPath, 'utf8'))),
+      source: path.basename(resolvedPath),
+    };
+  }
+
+  throw new Error(`${label} service account is not configured. Set the matching JSON env on Render or provide the local key file.`);
+}
+
+const firebaseServiceAccountConfig = loadServiceAccount({
+  label: 'Firebase',
+  jsonEnvKeys: [
+    'FIREBASE_SERVICE_ACCOUNT_JSON',
+    'FIREBASE_SERVICE_ACCOUNT_JSON_BASE64',
+    'GOOGLE_SERVICE_ACCOUNT_JSON',
+    'GOOGLE_SERVICE_ACCOUNT_JSON_BASE64',
+    'GOOGLE_APPLICATION_CREDENTIALS_JSON',
+  ],
+  fileCandidates: [
+    process.env.FIREBASE_SERVICE_ACCOUNT_PATH,
     process.env.SERVICE_ACCOUNT_PATH,
     path.join(__dirname, 'serviceAccountKey.json'),
     path.join(__dirname, 'key.json'),
-  ].filter(Boolean);
+  ],
+});
+const firebaseServiceAccount = firebaseServiceAccountConfig.account;
+const FIREBASE_PROJECT_ID = (process.env.FIREBASE_PROJECT_ID || firebaseServiceAccount.project_id || '').trim();
 
-  for (const candidate of fileCandidates) {
-    const resolvedPath = path.isAbsolute(candidate) ? candidate : path.resolve(__dirname, candidate);
-    if (!fs.existsSync(resolvedPath)) continue;
-    return normalizeServiceAccount(JSON.parse(fs.readFileSync(resolvedPath, 'utf8')));
-  }
-
-  throw new Error('Service account is not configured. Set GOOGLE_SERVICE_ACCOUNT_JSON on Render or provide key.json locally.');
-}
-
-const serviceAccount = loadServiceAccount();
+const vertexServiceAccountConfig = loadServiceAccount({
+  label: 'Vertex',
+  jsonEnvKeys: [
+    'VERTEX_SERVICE_ACCOUNT_JSON',
+    'VERTEX_SERVICE_ACCOUNT_JSON_BASE64',
+    'GOOGLE_SERVICE_ACCOUNT_JSON',
+    'GOOGLE_SERVICE_ACCOUNT_JSON_BASE64',
+    'GOOGLE_APPLICATION_CREDENTIALS_JSON',
+  ],
+  fileCandidates: [
+    process.env.VERTEX_SERVICE_ACCOUNT_PATH,
+    process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    path.join(__dirname, 'key.json'),
+    path.join(__dirname, 'serviceAccountKey.json'),
+  ],
+});
+const vertexServiceAccount = vertexServiceAccountConfig.account;
 
 if (!admin.apps.length) {
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
+    credential: admin.credential.cert(firebaseServiceAccount),
+    projectId: FIREBASE_PROJECT_ID,
   });
 }
 
@@ -100,7 +125,7 @@ const FCM_REQUEST_TIMEOUT_MS = Number(process.env.FCM_REQUEST_TIMEOUT_MS || 1000
 const AI_PROVIDER = (process.env.AI_PROVIDER || 'vertex').trim().toLowerCase();
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
-const VERTEX_PROJECT_ID = (process.env.VERTEX_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || serviceAccount.project_id || '').trim();
+const VERTEX_PROJECT_ID = (process.env.VERTEX_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || vertexServiceAccount.project_id || '').trim();
 const VERTEX_LOCATION = (process.env.VERTEX_LOCATION || 'us-central1').trim();
 const VERTEX_MODEL = (process.env.VERTEX_MODEL || GEMINI_MODEL || 'gemini-2.5-flash').trim();
 const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 30000);
@@ -108,11 +133,39 @@ const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 30);
 const AI_MAX_IMAGE_BYTES = Number(process.env.AI_MAX_IMAGE_BYTES || 5 * 1024 * 1024);
 const vertexAuth = new GoogleAuth({
   scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-  credentials: serviceAccount,
+  credentials: vertexServiceAccount,
 });
 
 function now() {
   return Date.now();
+}
+
+function maskId(value) {
+  const text = asString(value);
+  if (!text) return '';
+  if (text.length <= 6) return `${text.slice(0, 2)}***`;
+  return `${text.slice(0, 4)}***${text.slice(-2)}`;
+}
+
+function maskEmail(value) {
+  const text = asString(value);
+  if (!text || !text.includes('@')) return maskId(text);
+  const [name, domain] = text.split('@');
+  return `${name.slice(0, 4)}***@${domain}`;
+}
+
+function buildAiConfigWarnings() {
+  const warnings = [];
+  if (FIREBASE_PROJECT_ID && firebaseServiceAccount.project_id && FIREBASE_PROJECT_ID !== firebaseServiceAccount.project_id) {
+    warnings.push('FIREBASE_PROJECT_ID differs from Firebase credential project; ensure the service account has access to that Firebase project.');
+  }
+  if (VERTEX_PROJECT_ID && vertexServiceAccount.project_id && VERTEX_PROJECT_ID !== vertexServiceAccount.project_id) {
+    warnings.push('VERTEX_PROJECT_ID differs from Vertex credential project; ensure the service account has Vertex AI permissions on that project.');
+  }
+  if (AI_PROVIDER === 'vertex' && !VERTEX_PROJECT_ID) {
+    warnings.push('VERTEX_PROJECT_ID is missing.');
+  }
+  return warnings;
 }
 
 function normalizeCreatedAt(value) {
@@ -1010,7 +1063,24 @@ app.post('/api/ai/chat', async (req, res) => {
   }
 });
 
-app.get('/api/ai/health', (req, res) => {
+app.get('/api/ai/health', async (req, res) => {
+  const shouldCheckToken = String(req.query.check || '').toLowerCase() === '1' ||
+    String(req.query.check || '').toLowerCase() === 'true';
+  let vertexAuthReady = null;
+  let vertexAuthError = '';
+
+  if (AI_PROVIDER === 'vertex' && shouldCheckToken) {
+    try {
+      const client = await vertexAuth.getClient();
+      const accessToken = await client.getAccessToken();
+      const token = typeof accessToken === 'string' ? accessToken : accessToken?.token;
+      vertexAuthReady = Boolean(token);
+    } catch (error) {
+      vertexAuthReady = false;
+      vertexAuthError = error.message || 'Cannot get Vertex access token';
+    }
+  }
+
   res.status(200).json({
     success: true,
     provider: AI_PROVIDER,
@@ -1018,8 +1088,17 @@ app.get('/api/ai/health', (req, res) => {
     geminiApiConfigured: Boolean(GEMINI_API_KEY),
     vertexConfigured: Boolean(VERTEX_PROJECT_ID),
     model: AI_PROVIDER === 'vertex' ? VERTEX_MODEL : GEMINI_MODEL,
-    vertexProjectId: VERTEX_PROJECT_ID ? `${VERTEX_PROJECT_ID.slice(0, 4)}***` : '',
+    firebaseProjectId: maskId(FIREBASE_PROJECT_ID),
+    firebaseCredentialProjectId: maskId(firebaseServiceAccount.project_id),
+    firebaseCredentialSource: firebaseServiceAccountConfig.source,
+    vertexProjectId: maskId(VERTEX_PROJECT_ID),
+    vertexCredentialProjectId: maskId(vertexServiceAccount.project_id),
+    vertexCredentialClientEmail: maskEmail(vertexServiceAccount.client_email),
+    vertexCredentialSource: vertexServiceAccountConfig.source,
     vertexLocation: VERTEX_LOCATION,
+    vertexAuthReady,
+    vertexAuthError,
+    warnings: buildAiConfigWarnings(),
     timeoutMs: GEMINI_TIMEOUT_MS,
   });
 });
