@@ -485,8 +485,17 @@ async function callVertexGemini({ systemPrompt, history, message, imageUrl }) {
     if (!response.ok) {
       const messageText = data.error?.message || `Vertex Gemini request failed with ${response.status}`;
       const error = new Error(messageText);
-      error.vertexStatus = data.error?.status || '';
-      error.statusCode = response.status >= 500 ? 503 : 400;
+      const vertexStatus = data.error?.status || '';
+      error.vertexStatus = vertexStatus;
+      if (response.status === 403 || vertexStatus === 'PERMISSION_DENIED') {
+        error.statusCode = 403;
+      } else if (response.status === 404 || vertexStatus === 'NOT_FOUND') {
+        error.statusCode = 404;
+      } else if (response.status === 429 || vertexStatus === 'RESOURCE_EXHAUSTED') {
+        error.statusCode = 429;
+      } else {
+        error.statusCode = response.status >= 500 ? 503 : 400;
+      }
       throw error;
     }
 
@@ -1041,13 +1050,33 @@ app.post('/api/ai/chat', async (req, res) => {
       ? 'UNAUTHORIZED'
       : status === 400
         ? 'BAD_REQUEST'
-        : status === 413
-          ? 'IMAGE_TOO_LARGE'
-          : status === 504
-            ? 'AI_TIMEOUT'
-            : status === 503
-              ? 'AI_UNAVAILABLE'
-              : 'AI_ERROR';
+        : status === 403
+          ? 'AI_PERMISSION_DENIED'
+          : status === 404
+            ? 'AI_MODEL_NOT_FOUND'
+            : status === 413
+              ? 'IMAGE_TOO_LARGE'
+              : status === 429
+                ? 'AI_QUOTA_EXCEEDED'
+                : status === 504
+                  ? 'AI_TIMEOUT'
+                  : status === 503
+                    ? 'AI_UNAVAILABLE'
+                    : 'AI_ERROR';
+
+    const publicMessage = (() => {
+      if (status >= 500) return 'AI service is temporarily unavailable';
+      if (errorCode === 'AI_PERMISSION_DENIED') {
+        return 'Vertex AI service account does not have permission to call this model';
+      }
+      if (errorCode === 'AI_MODEL_NOT_FOUND') {
+        return 'Vertex AI model or location is not available for this project';
+      }
+      if (errorCode === 'AI_QUOTA_EXCEEDED') {
+        return 'Vertex AI quota is exhausted or billing is not ready';
+      }
+      return error.message;
+    })();
 
     console.error('AI chat failed:', {
       status,
@@ -1058,7 +1087,7 @@ app.post('/api/ai/chat', async (req, res) => {
     return res.status(status).json({
       success: false,
       errorCode,
-      message: status >= 500 ? 'AI service is temporarily unavailable' : error.message,
+      message: publicMessage,
     });
   }
 });
