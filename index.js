@@ -1,12 +1,76 @@
 require('dotenv').config();
 
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { PayOS } = require('@payos/node');
 const { GoogleAuth } = require('google-auth-library');
 
-const serviceAccount = require('./serviceAccountKey.json');
+function normalizeServiceAccount(serviceAccount) {
+  if (!serviceAccount || typeof serviceAccount !== 'object') {
+    throw new Error('Invalid service account config');
+  }
+
+  if (typeof serviceAccount.private_key === 'string') {
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+  }
+
+  const requiredFields = ['project_id', 'client_email', 'private_key'];
+  const missingFields = requiredFields.filter((field) => !serviceAccount[field]);
+  if (missingFields.length) {
+    throw new Error(`Service account config is missing: ${missingFields.join(', ')}`);
+  }
+
+  return serviceAccount;
+}
+
+function parseServiceAccountJson(rawValue, sourceName) {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return null;
+
+  try {
+    return normalizeServiceAccount(JSON.parse(raw));
+  } catch (jsonError) {
+    try {
+      return normalizeServiceAccount(JSON.parse(Buffer.from(raw, 'base64').toString('utf8')));
+    } catch (base64Error) {
+      throw new Error(`Cannot parse service account from ${sourceName}`);
+    }
+  }
+}
+
+function loadServiceAccount() {
+  const jsonEnvKeys = [
+    'GOOGLE_SERVICE_ACCOUNT_JSON',
+    'FIREBASE_SERVICE_ACCOUNT_JSON',
+    'VERTEX_SERVICE_ACCOUNT_JSON',
+    'GOOGLE_APPLICATION_CREDENTIALS_JSON',
+  ];
+
+  for (const envKey of jsonEnvKeys) {
+    const account = parseServiceAccountJson(process.env[envKey], envKey);
+    if (account) return account;
+  }
+
+  const fileCandidates = [
+    process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    process.env.SERVICE_ACCOUNT_PATH,
+    path.join(__dirname, 'serviceAccountKey.json'),
+    path.join(__dirname, 'key.json'),
+  ].filter(Boolean);
+
+  for (const candidate of fileCandidates) {
+    const resolvedPath = path.isAbsolute(candidate) ? candidate : path.resolve(__dirname, candidate);
+    if (!fs.existsSync(resolvedPath)) continue;
+    return normalizeServiceAccount(JSON.parse(fs.readFileSync(resolvedPath, 'utf8')));
+  }
+
+  throw new Error('Service account is not configured. Set GOOGLE_SERVICE_ACCOUNT_JSON on Render or provide key.json locally.');
+}
+
+const serviceAccount = loadServiceAccount();
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -33,7 +97,7 @@ const RETURN_URL = process.env.PAYOS_RETURN_URL || 'https://google.com';
 const CANCEL_URL = process.env.PAYOS_CANCEL_URL || 'https://google.com';
 const PAYOS_REQUEST_TIMEOUT_MS = Number(process.env.PAYOS_REQUEST_TIMEOUT_MS || 20000);
 const FCM_REQUEST_TIMEOUT_MS = Number(process.env.FCM_REQUEST_TIMEOUT_MS || 10000);
-const AI_PROVIDER = (process.env.AI_PROVIDER || 'gemini').trim().toLowerCase();
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'vertex').trim().toLowerCase();
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
 const VERTEX_PROJECT_ID = (process.env.VERTEX_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || serviceAccount.project_id || '').trim();
