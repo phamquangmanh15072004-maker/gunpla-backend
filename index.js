@@ -121,6 +121,7 @@ const ORDER_SWEEP_INTERVAL_MS = Number(process.env.ORDER_SWEEP_INTERVAL_MS || 60
 const RETURN_URL = process.env.PAYOS_RETURN_URL || 'https://google.com';
 const CANCEL_URL = process.env.PAYOS_CANCEL_URL || 'https://google.com';
 const PAYOS_REQUEST_TIMEOUT_MS = Number(process.env.PAYOS_REQUEST_TIMEOUT_MS || 20000);
+const PAYOS_MIN_AMOUNT = Number(process.env.PAYOS_MIN_AMOUNT || 10000);
 const FCM_REQUEST_TIMEOUT_MS = Number(process.env.FCM_REQUEST_TIMEOUT_MS || 10000);
 const AI_PROVIDER = (process.env.AI_PROVIDER || 'vertex').trim().toLowerCase();
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
@@ -176,6 +177,28 @@ function normalizeCreatedAt(value) {
 function createPayOSOrderCode() {
   // payOS requires a numeric orderCode. Firestore order ids can be UUIDs.
   return Date.now() * 1000 + Math.floor(Math.random() * 1000);
+}
+
+function getOrderShortCode(orderId) {
+  return String(orderId || '').replace(/[^a-zA-Z0-9]/g, '').slice(-6).toUpperCase() || 'ORDER';
+}
+
+function buildPayosDescription(orderId) {
+  return `THANH TOAN DH ${getOrderShortCode(orderId)}`.slice(0, 25);
+}
+
+function buildOrderItemSummary(order) {
+  const items = Array.isArray(order?.items) ? order.items : [];
+  return items
+    .map((item) => {
+      const product = item.product || {};
+      const name = takeText(product.name || item.productName || item.name || '', 36);
+      const quantity = Number(item.quantity || 1);
+      return name ? `${name} x${quantity}` : '';
+    })
+    .filter(Boolean)
+    .slice(0, 3)
+    .join(', ');
 }
 
 function withTimeout(promise, timeoutMs, message) {
@@ -875,6 +898,12 @@ app.post('/create-payment-link', async (req, res) => {
     if (!orderId || !Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ success: false, message: 'Invalid orderId or amount' });
     }
+    if (amount < PAYOS_MIN_AMOUNT) {
+      return res.status(400).json({
+        success: false,
+        message: `Bank transfer requires a minimum amount of ${PAYOS_MIN_AMOUNT} VND`,
+      });
+    }
 
     const orderRef = db.collection('orders').doc(orderId);
     const orderSnap = await orderRef.get();
@@ -900,11 +929,15 @@ app.post('/create-payment-link', async (req, res) => {
         bin: order.payosBin || '',
         accountNumber: order.payosAccountNumber || '',
         description: order.payosDescription || '',
+        orderShortCode: order.payosShortCode || getOrderShortCode(orderId),
+        itemSummary: order.payosItemSummary || buildOrderItemSummary(order),
       });
     }
 
     const orderCode = createPayOSOrderCode();
-    const description = `DH ${orderId.replace(/-/g, '').slice(-12).toUpperCase()}`;
+    const description = buildPayosDescription(orderId);
+    const orderShortCode = getOrderShortCode(orderId);
+    const itemSummary = buildOrderItemSummary(order);
     const paymentLink = await withTimeout(
       payos.paymentRequests.create({
         orderCode,
@@ -924,12 +957,17 @@ app.post('/create-payment-link', async (req, res) => {
       payosBin: paymentLink.bin || '',
       payosAccountNumber: paymentLink.accountNumber || '',
       payosDescription: paymentLink.description || description,
+      payosShortCode: orderShortCode,
+      payosItemSummary: itemSummary,
       updatedAt: now(),
     });
     await db.collection('payos_orders').doc(String(orderCode)).set({
       orderId,
       amount,
       paymentLinkId: paymentLink.paymentLinkId || '',
+      description: paymentLink.description || description,
+      orderShortCode,
+      itemSummary,
       createdAt: now(),
     });
 
@@ -939,6 +977,8 @@ app.post('/create-payment-link', async (req, res) => {
       bin: paymentLink.bin,
       accountNumber: paymentLink.accountNumber,
       description: paymentLink.description || description,
+      orderShortCode,
+      itemSummary,
     });
   } catch (error) {
     console.error('Create payment link failed:', error);
