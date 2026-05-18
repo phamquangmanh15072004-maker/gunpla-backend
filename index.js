@@ -328,12 +328,17 @@ async function fetchCartForAi(uid) {
   }).join('\n');
 }
 
-async function buildAiSystemPrompt(uid) {
+async function buildAiSystemPrompt(uid, options = {}) {
+  const includeCustomerContext = options.includeCustomerContext !== false;
   const [productsInfo, postsInfo, ordersInfo, cartInfo] = await Promise.all([
     fetchProductsForAi(),
     fetchPostsForAi(),
-    fetchOrdersForAi(uid),
-    fetchCartForAi(uid),
+    includeCustomerContext
+      ? fetchOrdersForAi(uid)
+      : Promise.resolve('Không sử dụng ngữ cảnh đơn hàng trong yêu cầu nhận diện ảnh này vì khách chưa hỏi trực tiếp về đơn hàng.'),
+    includeCustomerContext
+      ? fetchCartForAi(uid)
+      : Promise.resolve('Không sử dụng ngữ cảnh giỏ hàng trong yêu cầu nhận diện ảnh này vì khách chưa hỏi trực tiếp về giỏ hàng.'),
   ]);
 
   return `
@@ -388,6 +393,39 @@ function normalizeAiHistory(history) {
       return text ? { role, parts: [{ text }] } : null;
     })
     .filter(Boolean);
+}
+
+function appendImageRequestGuard(systemPrompt, hasImage) {
+  if (!hasImage) return systemPrompt;
+
+  return `${systemPrompt}
+
+QUY TẮC RIÊNG KHI TIN NHẮN CÓ ẢNH:
+- Ảnh khách gửi là ảnh tham khảo để nhận diện/tư vấn, không phải bằng chứng sản phẩm đó đang nằm trong giỏ hàng, đơn hàng hoặc kho Gunpla Hub.
+- Không được nói "đây là sản phẩm trong giỏ hàng của bạn" chỉ vì ảnh giống tên/sản phẩm trong mục GIỎ HÀNG. Chỉ dùng dữ liệu giỏ hàng khi khách hỏi rõ về giỏ hàng.
+- Khi nhận diện ảnh Gunpla, hãy nói thận trọng: "ảnh có vẻ là...", "mình thấy giống...", hoặc "có thể thuộc dòng..."; không khẳng định tuyệt đối nếu ảnh không đủ rõ.
+- Sau khi nhận diện ảnh, chỉ gợi ý sản phẩm shop gần nhất còn hàng và gắn [ID] nếu có dữ liệu phù hợp. Nếu không chắc, hãy hỏi thêm tên mẫu, grade, tỷ lệ hoặc ảnh góc khác.
+- Không dùng [AUTO_CART] chỉ dựa trên ảnh. Chỉ dùng [AUTO_CART] khi khách nhắn rõ muốn thêm vào giỏ một sản phẩm shop đã xác định bằng tên/ID và có số lượng cụ thể.
+`.trim();
+}
+
+function buildAiUserMessage(message, hasImage) {
+  const userText = takeText(message, 8000);
+  if (!hasImage) return userText;
+
+  const imageInstruction = [
+    'Người dùng vừa gửi ảnh để nhờ nhận diện/tư vấn Gunpla.',
+    'Hãy xử lý ảnh như ảnh tham khảo bên ngoài, không mặc định ảnh là sản phẩm trong giỏ hàng hay đơn hàng.',
+    'Nếu ảnh là Gunpla/mô hình, mô tả đặc điểm nhìn thấy rồi gợi ý sản phẩm gần nhất trong kho nếu có.',
+    'Không tự thêm giỏ hàng dựa trên ảnh.',
+  ].join('\n');
+
+  return userText ? `${userText}\n\n${imageInstruction}` : imageInstruction;
+}
+
+function isCustomerContextQuestion(message) {
+  const text = asString(message).toLowerCase();
+  return /giỏ|gio hang|cart|đơn|don hang|order|đã mua|da mua|mua rồi|mua roi|lịch sử|lich su/.test(text);
 }
 
 async function fetchImageAsInlineData(imageUrl) {
@@ -1129,11 +1167,17 @@ app.post('/api/ai/chat', async (req, res) => {
       });
     }
 
-    const systemPrompt = await buildAiSystemPrompt(uid);
+    const hasImage = Boolean(imageUrl);
+    const includeCustomerContext = !hasImage || isCustomerContextQuestion(message);
+    const systemPrompt = appendImageRequestGuard(
+      await buildAiSystemPrompt(uid, { includeCustomerContext }),
+      hasImage,
+    );
+    const aiMessage = buildAiUserMessage(message, hasImage);
     const aiText = await callGemini({
       systemPrompt,
       history: req.body.history,
-      message,
+      message: aiMessage,
       imageUrl,
     });
 
